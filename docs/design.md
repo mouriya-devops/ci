@@ -4,7 +4,7 @@
 
 CI 难写有两个原因。
 
-**一是基础设施约定在每个仓库里重写一遍，没有任何复用。** 2026-11-11 统计了本机 `mouriya-s-lab` 与 `moat-lab` 的自有仓库：
+**一是基础设施约定在每个仓库里重写一遍，没有任何复用。** 2026-11-11 统计了本机 `mouriya-s-lab`、`moat-lab` 与 `mouriya-devops` 的自有仓库：
 
 | 各仓库各自重复实现的内容 | workflow 文件数 |
 |---|---|
@@ -57,8 +57,8 @@ flowchart LR
 
 本仓库是**公开**仓库，只放流程，不放 secret。公开的原因：
 
-- 私有仓库里的可复用 workflow 只能被同一组织的仓库调用，而消费仓库分属 `mouriya-s-lab` 和 `moat-lab` 两个组织；
-- 公开仓库可以被两个组织共用，不用维护两份。
+- 私有仓库里的可复用 workflow 只能被同一组织的仓库调用，而本仓库在 `mouriya-devops`，消费仓库分属 `mouriya-devops`、`mouriya-s-lab` 和 `moat-lab` 三个组织；
+- 公开仓库可以被三个组织共用，不用维护多份。
 
 ## 可复用 workflow
 
@@ -67,8 +67,8 @@ flowchart LR
 | workflow | 交付形态 | 当前的消费仓库 |
 |---|---|---|
 | `check` | 运行消费仓库的 `mise run check` | 所有迁入的仓库 |
-| `image` | 构建镜像 → 推送到 `registry.237575.xyz` → 触发 Komodo 部署 | `mouriya-s-lab/`：runner-canary、hapi、github-agent-router、netbird-xray-proxy、paseo、moat-browser-deploy，以及在 GitHub 托管 runner 上推送镜像的 github-automation |
-| `workload-sync` | 把 workload repo 的 SOPS 解密后写入 Komodo Variables，再执行 RunSync | `mouriya-s-lab/`：homelab-apps、homelab-trading、vctcn-edge、runner-canary、moat-browser-deploy |
+| `image` | 构建镜像 → 推送到 `registry.237575.xyz` → 触发 Komodo 部署 | `mouriya-devops/`：runner-canary；`mouriya-s-lab/`：hapi、github-agent-router、netbird-xray-proxy、paseo、moat-browser-deploy，以及在 GitHub 托管 runner 上推送镜像的 github-automation |
+| `workload-sync` | 把 workload repo 的 SOPS 解密后写入 Komodo Variables，再执行 RunSync | `mouriya-devops/`：runner-canary；`mouriya-s-lab/`：homelab-apps、homelab-trading、vctcn-edge、moat-browser-deploy |
 | `release-artifact` | 运行消费仓库的发布任务生成产物 → 计算 checksum → 发布到 GitHub Release | `mouriya-s-lab/`：mattermost-plugin-bookmarks、mattermost-plugin-openusage、hapi、moat-browser-deploy；`moat-lab/`：mattermost-plugin-codexbar、mattermost-plugin-fulcrum |
 
 每个 workflow 的参数和 secret 以它自己文件里的 `workflow_call` 声明为准，由 actionlint 校验；本文档不重复列出字段。
@@ -103,7 +103,7 @@ flowchart LR
 
 并发分组的名字由本仓库根据传入的写入对象（Stack 名、镜像名、Release tag）拼出来。所有写同一个对象的调用都会落进同一个分组，消费仓库不自己声明并发。
 
-消费仓库一律显式传入所需的 secret，不使用 `secrets: inherit`。原因：`inherit` 不能跨组织；两个组织统一用显式传入，写法就只有一种。
+消费仓库一律显式传入所需的 secret，不使用 `secrets: inherit`。原因：`inherit` 不能跨组织；所有组织统一用显式传入，写法就只有一种。
 
 ## 版本
 
