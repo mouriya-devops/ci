@@ -1,0 +1,15 @@
+name: selftest-fork
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    uses: mouriya-devops/ci/.github/workflows/image.yml@main
+    with:
+      runs-on: '["self-hosted","linux"]'
+      mode: build-only
+      images: registry.237575.xyz/ci-selftest/alpha
+      tag: fork-pr
