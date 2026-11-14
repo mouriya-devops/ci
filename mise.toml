@@ -1,0 +1,7 @@
+[tools]
+"aqua:rhysd/actionlint" = "latest"
+shellcheck = "latest"
+
+[tasks.check]
+description = "Lint every workflow in .github/workflows"
+run = "actionlint"
