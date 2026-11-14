@@ -1,0 +1,30 @@
+name: wip-rel
+on: push
+permissions:
+  contents: read
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: wip-rel-${{ github.run_id }}
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/wip-rel-$GITHUB_RUN_ID" -f sha="$GITHUB_SHA" --jq .ref
+  rel:
+    needs: tag
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-artifact.yml
+    with:
+      platforms: '[{"name":"amd64","runs-on":["ubuntu-24.04"]},{"name":"arm64","runs-on":["ubuntu-24.04-arm"]}]'
+      mode: publish
+      tag: ${{ needs.tag.outputs.tag }}
+      prerelease: true
+  bo:
+    uses: ./.github/workflows/release-artifact.yml
+    with:
+      platforms: '[{"name":"amd64","runs-on":["ubuntu-24.04"]}]'
+      mode: build-only
