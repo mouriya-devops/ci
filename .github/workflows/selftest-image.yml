@@ -1,0 +1,63 @@
+name: selftest-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs-on:
+        type: string
+        default: '["ubuntu-24.04"]'
+      mode:
+        type: string
+        default: build-only
+      images:
+        description: Newline-separated repositories.
+        type: string
+        default: |
+          registry.237575.xyz/ci-selftest/alpha
+          registry.237575.xyz/ci-selftest/beta
+      tag:
+        description: Empty means selftest-<run_id>.
+        type: string
+        default: ''
+      channel:
+        type: string
+        default: ''
+      deployment-environment:
+        type: string
+        default: ''
+      version-file:
+        type: string
+        default: ''
+      version-key:
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    uses: mouriya-devops/ci/.github/workflows/image.yml@main
+    with:
+      runs-on: ${{ inputs.runs-on }}
+      mode: ${{ inputs.mode }}
+      images: ${{ inputs.images }}
+      tag: ${{ inputs.tag || format('selftest-{0}', github.run_id) }}
+      channel: ${{ inputs.channel }}
+      deployment-environment: ${{ inputs.deployment-environment }}
+      version-file: ${{ inputs.version-file }}
+      version-key: ${{ inputs.version-key }}
+    secrets:
+      KEYCLOAK_REGISTRY_CLIENT_SECRET: ${{ secrets.KEYCLOAK_REGISTRY_CLIENT_SECRET }}
+
+  outputs:
+    needs: image
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Print image outputs
+        env:
+          BUILT: ${{ needs.image.outputs.built }}
+          PUBLISHED: ${{ needs.image.outputs.published }}
+          REVISION: ${{ needs.image.outputs.revision }}
+        run: echo "built=$BUILT published=$PUBLISHED revision=$REVISION"
