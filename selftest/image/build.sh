@@ -10,7 +10,7 @@ docker buildx inspect ci-selftest >/dev/null 2>&1 \
 for role in alpha beta; do
   image="registry.237575.xyz/ci-selftest/$role"
   docker buildx build --builder ci-selftest --load \
-    --build-arg ROLE="$role" \
+    --build-arg ROLE="$role" --build-arg NONCE="${GITHUB_RUN_ID:-local}" \
     --label org.opencontainers.image.revision="$CI_REVISION" \
     --cache-from "type=gha,scope=ci-selftest-$role" \
     --cache-to "type=gha,scope=ci-selftest-$role,mode=max" \
