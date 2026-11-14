@@ -1,0 +1,12 @@
+name: selftest-fork
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    uses: mouriya-devops/ci/.github/workflows/check.yml@main
+    with:
+      runs-on: '["self-hosted","linux"]'
