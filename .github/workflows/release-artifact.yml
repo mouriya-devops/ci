@@ -1,0 +1,345 @@
+name: release-artifact
+
+on:
+  workflow_call:
+    inputs:
+      platforms:
+        description: >-
+          JSON array, at least one entry, of `{"name": <[a-z0-9-]+, unique>,
+          "runs-on": <non-empty array of runner labels>}`. Each platform runs
+          `mise run release` once on its runner. Pull requests from another
+          repository are rejected when any platform's labels include
+          `self-hosted`.
+        type: string
+        required: true
+      ref:
+        description: >-
+          Commit, branch or tag to check out and build. Empty means the
+          triggering commit. Resolved to one commit for every platform.
+        type: string
+        default: ''
+      mode:
+        description: >-
+          `build-only` uploads the verified asset set as the workflow artifact
+          `release-assets`; `publish` additionally publishes it as the GitHub
+          Release of `tag` (caller needs `contents: write`).
+        type: string
+        required: true
+      tag:
+        description: >-
+          Release tag. Empty means the triggering tag when the run was
+          triggered by a tag, otherwise empty. Required with `publish`; the
+          tag must exist, point at the built commit and have no Release yet.
+        type: string
+        default: ''
+      prerelease:
+        description: Publish as a prerelease that is not marked latest.
+        type: boolean
+        default: false
+      notes:
+        description: Release notes. Empty means GitHub's generated notes.
+        type: string
+        default: ''
+    outputs:
+      assets:
+        description: Newline-separated asset names, including `SHA256SUMS`.
+        value: ${{ jobs.assemble.outputs.assets }}
+      release-url:
+        description: URL of the published Release (`publish` mode only).
+        value: ${{ jobs.assemble.outputs.release-url }}
+
+jobs:
+  parse:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      platforms: ${{ steps.parse.outputs.platforms }}
+      revision: ${{ steps.parse.outputs.revision }}
+      mode: ${{ steps.parse.outputs.mode }}
+      tag: ${{ steps.parse.outputs.tag }}
+    steps:
+      - name: Parse inputs
+        id: parse
+        env:
+          IN_PLATFORMS: ${{ inputs.platforms }}
+          IN_REF: ${{ inputs.ref }}
+          IN_MODE: ${{ inputs.mode }}
+          IN_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=invalid input $1::$1: $2"; exit 1; }
+
+          jq -e 'type == "array"' <<<"$IN_PLATFORMS" >/dev/null 2>&1 \
+            || fail platforms "must be a JSON array, got '$IN_PLATFORMS'"
+          [ "$(jq length <<<"$IN_PLATFORMS")" -gt 0 ] || fail platforms "must list at least one platform"
+          bad=$(jq -r '.[] | select((type != "object") or ((.name | type) != "string") or ((.name | test("^[a-z0-9-]+$")) | not)) | tojson' <<<"$IN_PLATFORMS" 2>/dev/null | head -n1)
+          [ -z "$bad" ] || fail platforms "entry $bad needs a \"name\" matching [a-z0-9-]+"
+          dup=$(jq -r '[.[].name] | group_by(.) | map(select(length > 1) | .[0]) | first // empty' <<<"$IN_PLATFORMS")
+          [ -z "$dup" ] || fail platforms "name '$dup' is listed twice"
+          bad=$(jq -r '.[] | select(((.["runs-on"] | type) != "array") or ((.["runs-on"] | length) == 0) or any(.["runs-on"][]; (type != "string") or (length == 0))) | .name' <<<"$IN_PLATFORMS" | head -n1)
+          [ -z "$bad" ] || fail platforms "platform '$bad' needs \"runs-on\" as a non-empty array of non-empty strings"
+          platforms=$(jq -c '[.[] | {name, "runs-on": .["runs-on"]}]' <<<"$IN_PLATFORMS")
+
+          case "$IN_MODE" in
+            build-only|publish) ;;
+            *) fail mode "must be 'build-only' or 'publish', got '$IN_MODE'" ;;
+          esac
+          if [ "$IN_MODE" = publish ]; then
+            [ -n "$IN_TAG" ] || fail tag "is required with mode publish (the run was not triggered by a tag)"
+          fi
+          if [ -n "$IN_TAG" ] && ! git check-ref-format "refs/tags/$IN_TAG"; then
+            fail tag "'$IN_TAG' is not a valid tag name"
+          fi
+
+          case "$EVENT_NAME" in
+            pull_request|pull_request_target)
+              if [ "$HEAD_REPO" != "$REPO" ] \
+                && jq -e 'any(.[]["runs-on"][]; ascii_downcase == "self-hosted")' <<<"$platforms" >/dev/null; then
+                fail platforms "pull request from '${HEAD_REPO:-<deleted repository>}' must not run on self-hosted runners of $REPO"
+              fi
+              ;;
+          esac
+
+          ref=${IN_REF:-$SHA}
+          revision=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "$API/commits/$(jq -rn --arg r "$ref" '$r | @uri')" | jq -er .sha) \
+            || fail ref "'$ref' does not resolve to a commit of $REPO"
+
+          {
+            echo "platforms=$platforms"
+            echo "revision=$revision"
+            echo "mode=$IN_MODE"
+            echo "tag=$IN_TAG"
+          } >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: parse
+    name: build (${{ matrix.platform.name }})
+    strategy:
+      fail-fast: true
+      matrix:
+        platform: ${{ fromJSON(needs.parse.outputs.platforms) }}
+    runs-on: ${{ matrix.platform.runs-on }}
+    permissions:
+      contents: read
+    env:
+      CI_MODE: ${{ needs.parse.outputs.mode }}
+      CI_RELEASE_TAG: ${{ needs.parse.outputs.tag }}
+      CI_RELEASE_PLATFORM: ${{ matrix.platform.name }}
+      CI_REVISION: ${{ needs.parse.outputs.revision }}
+    steps:
+      - uses: actions/checkout@main
+        with:
+          ref: ${{ needs.parse.outputs.revision }}
+          persist-credentials: false
+
+      - name: Create the empty release directory
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/ci-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_RELEASE_PLATFORM"
+          mkdir "$dir"
+          echo "CI_RELEASE_DIR=$dir" >>"$GITHUB_ENV"
+
+      - name: Install mise and repository toolchain
+        uses: jdx/mise-action@main
+
+      - name: mise run release
+        run: mise run release
+
+      - name: Verify release output
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r -d '' entry; do
+            name=${entry#"$CI_RELEASE_DIR"/}
+            if [ -L "$entry" ]; then
+              echo "::error title=release output::$name is a symbolic link; write regular files only"
+              status=1
+            elif [ -d "$entry" ]; then
+              echo "::error title=release output::$name is a directory; write top-level regular files only"
+              status=1
+            elif [ ! -f "$entry" ]; then
+              echo "::error title=release output::$name is not a regular file"
+              status=1
+            elif [ "$name" = SHA256SUMS ]; then
+              echo "::error title=release output::SHA256SUMS is reserved; the workflow writes it"
+              status=1
+            fi
+          done < <(find "$CI_RELEASE_DIR" -mindepth 1 -maxdepth 1 -print0)
+          if [ -z "$(find "$CI_RELEASE_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            echo "::error title=release output::mise run release wrote nothing to CI_RELEASE_DIR"
+            status=1
+          fi
+          [ "$status" = 0 ]
+          ls -l "$CI_RELEASE_DIR"
+
+      - name: Upload platform assets
+        uses: actions/upload-artifact@main
+        with:
+          name: ci-release-${{ matrix.platform.name }}
+          path: ${{ env.CI_RELEASE_DIR }}
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    needs: [parse, build]
+    runs-on: ubuntu-24.04
+    outputs:
+      assets: ${{ steps.sums.outputs.assets }}
+      release-url: ${{ steps.publish.outputs.release-url }}
+    env:
+      CI_MODE: ${{ needs.parse.outputs.mode }}
+      CI_RELEASE_TAG: ${{ needs.parse.outputs.tag }}
+      CI_REVISION: ${{ needs.parse.outputs.revision }}
+      PLATFORMS: ${{ needs.parse.outputs.platforms }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      NOTES: ${{ inputs.notes }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download platform assets
+        uses: actions/download-artifact@main
+        with:
+          pattern: ci-release-*
+          path: ${{ runner.temp }}/ci-release-platforms
+
+      - name: Assemble assets and SHA256SUMS
+        id: sums
+        run: |
+          set -euo pipefail
+          platforms_dir="$RUNNER_TEMP/ci-release-platforms"
+          assets_dir="$RUNNER_TEMP/ci-release-assets"
+          mkdir "$assets_dir"
+          echo "ASSETS_DIR=$assets_dir" >>"$GITHUB_ENV"
+          : >"$RUNNER_TEMP/ci-release-by-platform"
+          status=0
+          for name in $(jq -r '.[].name' <<<"$PLATFORMS"); do
+            dir="$platforms_dir/ci-release-$name"
+            [ -d "$dir" ] || { echo "::error title=assets::no assets downloaded for platform $name"; status=1; continue; }
+            while IFS= read -r -d '' file; do
+              base=${file##*/}
+              if [ -e "$assets_dir/$base" ]; then
+                owner=$(awk -v f="$base" '$2 == f { print $1 }' "$RUNNER_TEMP/ci-release-by-platform")
+                echo "::error title=duplicate asset::$base is produced by both platform $owner and platform $name"
+                status=1
+                continue
+              fi
+              cp "$file" "$assets_dir/$base"
+              echo "$name $base" >>"$RUNNER_TEMP/ci-release-by-platform"
+            done < <(find "$dir" -mindepth 1 -maxdepth 1 -type f -print0)
+          done
+          [ "$status" = 0 ]
+          cd "$assets_dir"
+          find . -mindepth 1 -maxdepth 1 -type f -printf '%f\0' | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS
+          sha256sum --check SHA256SUMS
+          {
+            echo "assets<<CI_ASSETS_EOF"
+            LC_ALL=C ls -1
+            echo "CI_ASSETS_EOF"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload the verified asset set
+        uses: actions/upload-artifact@main
+        with:
+          name: release-assets
+          path: ${{ env.ASSETS_DIR }}
+          if-no-files-found: error
+
+      - name: Check the tag points at the built commit
+        if: env.CI_MODE == 'publish'
+        run: |
+          set -euo pipefail
+          tagged=$(gh api "repos/$GH_REPO/commits/refs/tags/$CI_RELEASE_TAG" --jq .sha 2>/dev/null) || {
+            echo "::error title=tag::refs/tags/$CI_RELEASE_TAG does not exist in $GH_REPO"
+            exit 1
+          }
+          if [ "$tagged" != "$CI_REVISION" ]; then
+            echo "::error title=tag::refs/tags/$CI_RELEASE_TAG points at $tagged, but this run built $CI_REVISION"
+            exit 1
+          fi
+          echo "refs/tags/$CI_RELEASE_TAG points at $CI_REVISION"
+
+      - name: Check the tag has no Release
+        if: env.CI_MODE == 'publish'
+        run: |
+          set -euo pipefail
+          if existing=$(gh api "repos/$GH_REPO/releases/tags/$CI_RELEASE_TAG" --jq .html_url 2>/dev/null); then
+            echo "::error title=release exists::$CI_RELEASE_TAG already has a Release ($existing); Releases are not overwritten"
+            exit 1
+          fi
+          # A draft Release is not addressable by tag; refuse those too.
+          draft=$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate \
+            --jq ".[] | select(.draft and .tag_name == \"$CI_RELEASE_TAG\") | .html_url" | head -n1)
+          if [ -n "$draft" ]; then
+            echo "::error title=release exists::$CI_RELEASE_TAG already has a draft Release ($draft)"
+            exit 1
+          fi
+
+      - name: Create the draft Release
+        if: env.CI_MODE == 'publish'
+        run: |
+          set -euo pipefail
+          args=(--draft --verify-tag --title "$CI_RELEASE_TAG")
+          if [ -n "$NOTES" ]; then args+=(--notes "$NOTES"); else args+=(--generate-notes); fi
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease --latest=false); fi
+          gh release create "$CI_RELEASE_TAG" "${args[@]}"
+          echo "DRAFT_CREATED=true" >>"$GITHUB_ENV"
+
+      - name: Upload Release assets
+        if: env.CI_MODE == 'publish'
+        run: |
+          set -euo pipefail
+          cd "$ASSETS_DIR"
+          gh release upload "$CI_RELEASE_TAG" ./*
+
+      - name: Publish the Release
+        id: publish
+        if: env.CI_MODE == 'publish'
+        run: |
+          set -euo pipefail
+          args=(--draft=false)
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease --latest=false); fi
+          gh release edit "$CI_RELEASE_TAG" "${args[@]}"
+          url=$(gh release view "$CI_RELEASE_TAG" --json url --jq .url)
+          echo "release-url=$url" >>"$GITHUB_OUTPUT"
+          echo "RELEASE_URL=$url" >>"$GITHUB_ENV"
+
+      - name: Delete this run's draft after a failed publication
+        if: failure() && env.DRAFT_CREATED == 'true' && env.RELEASE_URL == ''
+        run: gh release delete "$CI_RELEASE_TAG" --yes
+
+      - name: Summarize
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo '### release-artifact'
+            echo
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| mode | \`$CI_MODE\` |"
+            echo "| tag | \`${CI_RELEASE_TAG:-none}\` |"
+            echo "| revision | \`$CI_REVISION\` |"
+            echo "| release-url | ${RELEASE_URL:-none} |"
+            echo
+            echo '| platform | asset |'
+            echo '|---|---|'
+            if [ -f "$RUNNER_TEMP/ci-release-by-platform" ]; then
+              while read -r platform asset; do
+                echo "| $platform | \`$asset\` |"
+              done <"$RUNNER_TEMP/ci-release-by-platform"
+            fi
+            echo
+            echo "\`SHA256SUMS\`:"
+            echo
+            echo '```'
+            cat "${ASSETS_DIR:-/nonexistent}/SHA256SUMS" 2>/dev/null || echo 'not generated'
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"

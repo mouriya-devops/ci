@@ -1,0 +1,85 @@
+name: selftest-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        type: string
+        default: '[{"name":"amd64","runs-on":["ubuntu-24.04"]},{"name":"arm64","runs-on":["ubuntu-24.04-arm"]}]'
+      ref:
+        description: Commit to build; empty means the dispatched commit.
+        type: string
+        default: ''
+      mode:
+        type: string
+        default: publish
+      tag:
+        description: "'auto' = selftest-release-<run_id>, 'none' = empty, anything else verbatim."
+        type: string
+        default: auto
+      create-tag:
+        description: "Create the tag first at: 'head' (dispatched commit), 'parent' (its parent) or 'none'."
+        type: string
+        default: head
+      prerelease:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve and create the self-test tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_TAG: ${{ inputs.tag }}
+          CREATE_TAG: ${{ inputs.create-tag }}
+        run: |
+          set -euo pipefail
+          case "$IN_TAG" in
+            auto) tag="selftest-release-$GITHUB_RUN_ID" ;;
+            none) tag='' ;;
+            *) tag=$IN_TAG ;;
+          esac
+          case "$CREATE_TAG" in
+            head) target=$GITHUB_SHA ;;
+            parent) target=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" --jq '.parents[0].sha') ;;
+            none) target='' ;;
+            *) echo "::error::create-tag must be head, parent or none"; exit 1 ;;
+          esac
+          if [ -n "$target" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$target" --jq .ref
+            echo "created refs/tags/$tag at $target"
+          fi
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+
+  release:
+    needs: tag
+    permissions:
+      contents: write
+    uses: mouriya-devops/ci/.github/workflows/release-artifact.yml@main
+    with:
+      platforms: ${{ inputs.platforms }}
+      ref: ${{ inputs.ref }}
+      mode: ${{ inputs.mode }}
+      tag: ${{ needs.tag.outputs.tag }}
+      prerelease: ${{ inputs.prerelease }}
+
+  outputs:
+    needs: release
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Print release-artifact outputs
+        env:
+          ASSETS: ${{ needs.release.outputs.assets }}
+          RELEASE_URL: ${{ needs.release.outputs.release-url }}
+        run: printf 'release-url=%s\nassets:\n%s\n' "$RELEASE_URL" "$ASSETS"

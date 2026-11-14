@@ -9,3 +9,7 @@ run = "actionlint"
 [tasks.build]
 description = "Self-test fixture for image.yml: build ci-selftest/alpha and ci-selftest/beta"
 run = "selftest/image/build.sh"
+
+[tasks.release]
+description = "Self-test fixture for release-artifact.yml: write one file per platform"
+run = "selftest/release/release.sh"
