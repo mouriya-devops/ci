@@ -318,7 +318,10 @@ jobs:
             echo '|---|---|---|'
             while IFS= read -r image; do
               for tag in "$CI_IMAGE_TAG" ${CHANNEL:+"$CHANNEL"}; do
-                digest=$(awk -v i="$image" -v t="$tag" '$1 == i && $2 == t { print $3 }' "${CI_DIGESTS:-/dev/null}" 2>/dev/null)
+                digest=''
+                if [ -f "${CI_DIGESTS:-}" ]; then
+                  digest=$(awk -v i="$image" -v t="$tag" '$1 == i && $2 == t { print $3 }' "$CI_DIGESTS")
+                fi
                 echo "| \`$image\` | \`$tag\` | ${digest:-not pushed} |"
               done
             done <<<"$CI_IMAGES"
