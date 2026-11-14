@@ -1,0 +1,545 @@
+name: image
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          JSON array of runner labels for the build/publish job, passed to
+          `runs-on: fromJSON(...)`: a GARM self-hosted label set, or a
+          GitHub-hosted runner that pushes over the public internet. Pull
+          requests from another repository are rejected when any label is
+          `self-hosted`.
+        type: string
+        required: true
+      ref:
+        description: >-
+          Commit, branch or tag to check out and build. Empty means the
+          triggering commit.
+        type: string
+        default: ''
+      mode:
+        description: >-
+          `build-only` runs `mise run build` and verifies the local images;
+          `publish` additionally pushes `tag`, moves `channel` and sends the
+          signal.
+        type: string
+        required: true
+      images:
+        description: >-
+          Newline-separated full repositories, each starting with
+          `registry.237575.xyz/`, no duplicates. The `build` task must leave
+          `<repository>:<tag>` in the local docker daemon for every entry.
+        type: string
+        required: true
+      tag:
+        description: >-
+          Immutable tag shared by all images, matching
+          `[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`. An existing remote tag is
+          overwritten only when its revision label equals this run's revision.
+        type: string
+        required: true
+      channel:
+        description: >-
+          Optional channel tag moved to the immutable tag after every image's
+          immutable tag is pushed and verified. Same charset as `tag`, must
+          differ from it. Not allowed with `build-only`.
+        type: string
+        default: ''
+      deployment-environment:
+        description: >-
+          Signal variant "Deployment": create a GitHub Deployment for the
+          revision in this environment (caller needs `deployments: write`).
+          Excludes `version-file`/`version-key`; not allowed with `build-only`.
+        type: string
+        default: ''
+      version-file:
+        description: >-
+          Signal variant "version commit": path of the file on the default
+          branch whose single `<version-key>=` line is rewritten to
+          `<version-key>=<tag>` (caller needs `contents: write`). Set together
+          with `version-key`; not allowed with `build-only`.
+        type: string
+        default: ''
+      version-key:
+        description: >-
+          Key of the version line in `version-file`. Set together with
+          `version-file`.
+        type: string
+        default: ''
+    secrets:
+      KEYCLOAK_REGISTRY_CLIENT_SECRET:
+        description: >-
+          Keycloak `registry` client secret; required in `publish` mode. Pass
+          it explicitly, not with `secrets: inherit`.
+        required: false
+    outputs:
+      built:
+        description: "'true' only when every image was built and its local revision label verified."
+        value: ${{ jobs.build.outputs.built || jobs.publish.outputs.built }}
+      published:
+        description: "'true' only when every `publish` step, including the signal, succeeded."
+        value: ${{ jobs.publish.outputs.published }}
+      revision:
+        description: Full SHA of the checked-out commit.
+        value: ${{ jobs.build.outputs.revision || jobs.publish.outputs.revision }}
+
+jobs:
+  parse:
+    runs-on: ubuntu-24.04
+    permissions: {}
+    outputs:
+      runs-on: ${{ steps.parse.outputs.runs-on }}
+      ref: ${{ steps.parse.outputs.ref }}
+      mode: ${{ steps.parse.outputs.mode }}
+      images: ${{ steps.parse.outputs.images }}
+      tag: ${{ steps.parse.outputs.tag }}
+      channel: ${{ steps.parse.outputs.channel }}
+      signal: ${{ steps.parse.outputs.signal }}
+      deployment-environment: ${{ steps.parse.outputs.deployment-environment }}
+      version-file: ${{ steps.parse.outputs.version-file }}
+      version-key: ${{ steps.parse.outputs.version-key }}
+    steps:
+      - name: Parse inputs
+        id: parse
+        env:
+          IN_RUNS_ON: ${{ inputs.runs-on }}
+          IN_REF: ${{ inputs.ref }}
+          IN_MODE: ${{ inputs.mode }}
+          IN_IMAGES: ${{ inputs.images }}
+          IN_TAG: ${{ inputs.tag }}
+          IN_CHANNEL: ${{ inputs.channel }}
+          IN_DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment-environment }}
+          IN_VERSION_FILE: ${{ inputs.version-file }}
+          IN_VERSION_KEY: ${{ inputs.version-key }}
+          HAS_REGISTRY_SECRET: ${{ secrets.KEYCLOAK_REGISTRY_CLIENT_SECRET != '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=invalid input $1::$1: $2"; exit 1; }
+          tag_re='^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'
+          repo_re='^registry\.237575\.xyz/[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$'
+          single_line() { [[ "$2" != *$'\n'* ]] || fail "$1" "must be a single line"; }
+
+          jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' \
+            <<<"$IN_RUNS_ON" >/dev/null 2>&1 \
+            || fail runs-on "must be a non-empty JSON array of non-empty strings, got '$IN_RUNS_ON'"
+          runs_on=$(jq -c . <<<"$IN_RUNS_ON")
+
+          case "$IN_MODE" in
+            build-only|publish) ;;
+            *) fail mode "must be 'build-only' or 'publish', got '$IN_MODE'" ;;
+          esac
+
+          images=()
+          while IFS= read -r line; do
+            line=$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' <<<"$line")
+            [ -n "$line" ] || continue
+            [[ "$line" =~ $repo_re ]] \
+              || fail images "'$line' is not a repository under registry.237575.xyz/ (no tag or digest)"
+            for seen in "${images[@]}"; do
+              [ "$seen" != "$line" ] || fail images "'$line' is listed twice"
+            done
+            images+=("$line")
+          done <<<"$IN_IMAGES"
+          [ "${#images[@]}" -gt 0 ] || fail images "must list at least one repository"
+
+          [[ "$IN_TAG" =~ $tag_re ]] || fail tag "'$IN_TAG' does not match $tag_re"
+          if [ -n "$IN_CHANNEL" ]; then
+            [[ "$IN_CHANNEL" =~ $tag_re ]] || fail channel "'$IN_CHANNEL' does not match $tag_re"
+            [ "$IN_CHANNEL" != "$IN_TAG" ] || fail channel "must differ from tag '$IN_TAG'"
+          fi
+
+          single_line deployment-environment "$IN_DEPLOYMENT_ENVIRONMENT"
+          single_line version-file "$IN_VERSION_FILE"
+          if [ -n "$IN_VERSION_FILE" ] && [ -z "$IN_VERSION_KEY" ]; then
+            fail version-key "must be set together with version-file"
+          fi
+          if [ -z "$IN_VERSION_FILE" ] && [ -n "$IN_VERSION_KEY" ]; then
+            fail version-file "must be set together with version-key"
+          fi
+          if [ -n "$IN_VERSION_KEY" ] && ! [[ "$IN_VERSION_KEY" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            fail version-key "'$IN_VERSION_KEY' is not a KEY name ([A-Za-z_][A-Za-z0-9_]*)"
+          fi
+          if [ -n "$IN_DEPLOYMENT_ENVIRONMENT" ] && [ -n "$IN_VERSION_FILE" ]; then
+            fail deployment-environment "excludes version-file/version-key: choose one signal"
+          fi
+          if [ -n "$IN_DEPLOYMENT_ENVIRONMENT" ]; then
+            signal=deployment
+          elif [ -n "$IN_VERSION_FILE" ]; then
+            signal=version-commit
+          else
+            signal=none
+          fi
+
+          if [ "$IN_MODE" = build-only ]; then
+            [ -z "$IN_CHANNEL" ] || fail channel "not allowed with mode build-only"
+            [ -z "$IN_DEPLOYMENT_ENVIRONMENT" ] || fail deployment-environment "not allowed with mode build-only"
+            [ -z "$IN_VERSION_FILE" ] || fail version-file "not allowed with mode build-only"
+          else
+            [ "$HAS_REGISTRY_SECRET" = true ] \
+              || fail KEYCLOAK_REGISTRY_CLIENT_SECRET "secret is required with mode publish; pass it explicitly"
+          fi
+
+          case "$EVENT_NAME" in
+            pull_request|pull_request_target)
+              if [ "$HEAD_REPO" != "$REPO" ] \
+                && jq -e 'any(.[]; ascii_downcase == "self-hosted")' <<<"$runs_on" >/dev/null; then
+                fail runs-on "pull request from '${HEAD_REPO:-<deleted repository>}' must not run on self-hosted runners of $REPO"
+              fi
+              ;;
+          esac
+
+          {
+            echo "runs-on=$runs_on"
+            echo "ref=${IN_REF:-$SHA}"
+            echo "mode=$IN_MODE"
+            echo "images<<CI_IMAGES_EOF"
+            printf '%s\n' "${images[@]}"
+            echo "CI_IMAGES_EOF"
+            echo "tag=$IN_TAG"
+            echo "channel=$IN_CHANNEL"
+            echo "signal=$signal"
+            echo "deployment-environment=$IN_DEPLOYMENT_ENVIRONMENT"
+            echo "version-file=$IN_VERSION_FILE"
+            echo "version-key=$IN_VERSION_KEY"
+          } >>"$GITHUB_OUTPUT"
+
+  # build-only and publish share the build steps through YAML anchors. They are
+  # separate jobs so a build-only run never loads the token action or a
+  # registry credential.
+  build:
+    needs: parse
+    if: needs.parse.outputs.mode == 'build-only'
+    runs-on: ${{ fromJSON(needs.parse.outputs.runs-on) }}
+    permissions:
+      contents: read
+    outputs:
+      built: ${{ steps.verify-local.outputs.built }}
+      revision: ${{ steps.checkout.outputs.revision }}
+    env: &env
+      CI_MODE: ${{ needs.parse.outputs.mode }}
+      CI_IMAGES: ${{ needs.parse.outputs.images }}
+      CI_IMAGE_TAG: ${{ needs.parse.outputs.tag }}
+      CHANNEL: ${{ needs.parse.outputs.channel }}
+      SIGNAL: ${{ needs.parse.outputs.signal }}
+      DEPLOYMENT_ENVIRONMENT: ${{ needs.parse.outputs.deployment-environment }}
+      VERSION_FILE: ${{ needs.parse.outputs.version-file }}
+      VERSION_KEY: ${{ needs.parse.outputs.version-key }}
+      REGISTRY: registry.237575.xyz
+      REVISION_LABEL: org.opencontainers.image.revision
+    steps:
+      - &checkout
+        uses: actions/checkout@main
+        with:
+          ref: ${{ needs.parse.outputs.ref }}
+          persist-credentials: false
+
+      - &resolve-revision
+        name: Resolve revision
+        id: checkout
+        run: |
+          set -euo pipefail
+          revision=$(git rev-parse HEAD)
+          echo "CI_REVISION=$revision" >>"$GITHUB_ENV"
+          echo "revision=$revision" >>"$GITHUB_OUTPUT"
+          echo "CI_DIGESTS=$RUNNER_TEMP/ci-image-digests-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >>"$GITHUB_ENV"
+
+      - &install-mise
+        name: Install mise and repository toolchain
+        uses: jdx/mise-action@main
+
+      - &cache-runtime
+        name: Expose the Actions cache runtime to the build task
+        uses: actions/github-script@main
+        with:
+          script: |
+            for (const [key, value] of Object.entries(process.env)) {
+              if (/^ACTIONS_(RUNTIME_TOKEN|RUNTIME_URL|RESULTS_URL|CACHE_URL|CACHE_SERVICE_V2)$/.test(key) && value) {
+                core.exportVariable(key, value);
+              }
+            }
+
+      - &build
+        name: mise run build
+        run: |
+          set -euo pipefail
+          mise run build
+          echo "BUILD_COMPLETED_AT=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" >>"$GITHUB_ENV"
+
+      - &verify-local
+        name: Verify local images
+        id: verify-local
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r image; do
+            ref="$image:$CI_IMAGE_TAG"
+            if ! docker image inspect "$ref" >/dev/null 2>&1; then
+              echo "::error title=missing image::$ref does not exist in the local docker daemon after mise run build"
+              status=1
+              continue
+            fi
+            revision=$(docker image inspect "$ref" --format "{{ with .Config.Labels }}{{ index . \"$REVISION_LABEL\" }}{{ end }}")
+            if [ "$revision" != "$CI_REVISION" ]; then
+              echo "::error title=revision label::$ref has $REVISION_LABEL='$revision', expected $CI_REVISION"
+              status=1
+            else
+              echo "$ref $REVISION_LABEL=$revision"
+            fi
+          done <<<"$CI_IMAGES"
+          [ "$status" = 0 ]
+          echo "built=true" >>"$GITHUB_OUTPUT"
+
+      - &summarize
+        name: Summarize
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo '### image'
+            echo
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| mode | \`$CI_MODE\` |"
+            echo "| revision | \`${CI_REVISION:-unresolved}\` |"
+            echo "| last build completed | ${BUILD_COMPLETED_AT:-not completed} |"
+            if [ "$CI_MODE" = publish ]; then
+              echo "| token exchange started | ${TOKEN_STARTED_AT:-not started} |"
+              if [ "$SIGNAL" = none ]; then result=none; else result=${SIGNAL_RESULT:-not sent}; fi
+              echo "| signal | \`$SIGNAL\`: $result |"
+              echo "| published | ${PUBLISHED:-false} |"
+            fi
+            echo
+            echo '| image | tag | digest |'
+            echo '|---|---|---|'
+            while IFS= read -r image; do
+              for tag in "$CI_IMAGE_TAG" ${CHANNEL:+"$CHANNEL"}; do
+                digest=''
+                if [ -f "${CI_DIGESTS:-}" ]; then
+                  digest=$(awk -v i="$image" -v t="$tag" '$1 == i && $2 == t { print $3 }' "$CI_DIGESTS")
+                fi
+                echo "| \`$image\` | \`$tag\` | ${digest:-not pushed} |"
+              done
+            done <<<"$CI_IMAGES"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: parse
+    if: needs.parse.outputs.mode == 'publish'
+    runs-on: ${{ fromJSON(needs.parse.outputs.runs-on) }}
+    outputs:
+      built: ${{ steps.verify-local.outputs.built }}
+      published: ${{ steps.published.outputs.published }}
+      revision: ${{ steps.checkout.outputs.revision }}
+    env: *env
+    steps:
+      - *checkout
+      - *resolve-revision
+
+      - name: Preflight version line on the default branch
+        if: env.SIGNAL == 'version-commit'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          branch=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" "$API" | jq -er .default_branch)
+          file=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github.raw+json' \
+            "$API/contents/$VERSION_FILE?ref=$branch")
+          count=$(grep -c "^$VERSION_KEY=" <<<"$file" || true)
+          if [ "$count" != 1 ]; then
+            echo "::error title=version line::$VERSION_FILE on $branch has $count lines starting with '$VERSION_KEY=', expected exactly 1"
+            exit 1
+          fi
+          echo "$VERSION_FILE on $branch has exactly one '$VERSION_KEY=' line"
+
+      - *install-mise
+      - *cache-runtime
+      - *build
+      - *verify-local
+
+      - name: Record token exchange start
+        run: echo "TOKEN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" >>"$GITHUB_ENV"
+
+      - name: Fetch registry token
+        id: registry-token
+        uses: mouriya-devops/keycloak-token-action@main
+        with:
+          keycloak-url: https://keycloak.237575.xyz
+          realm: registry
+          client-id: registry
+          client-secret: ${{ secrets.KEYCLOAK_REGISTRY_CLIENT_SECRET }}
+
+      - name: Log in to the registry
+        env:
+          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token }}
+        run: |
+          set -euo pipefail
+          config="$RUNNER_TEMP/ci-image-docker-config-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$config"
+          echo "DOCKER_CONFIG=$config" >>"$GITHUB_ENV"
+          printf '%s' "$REGISTRY_TOKEN" | DOCKER_CONFIG="$config" docker login "$REGISTRY" -u sa-registry --password-stdin
+          # Registry API reader: inspects remote tags without pulling them over the local tags.
+          cat >"$config/registry-api.sh" <<'SH'
+          # remote_manifest <repository> <reference>: prints "<digest> <revision label>", or nothing when absent.
+          remote_manifest() {
+            local name=${1#"$REGISTRY"/} reference=$2 challenge realm service token headers body status digest child config revision
+            challenge=$(curl -sS -o /dev/null -D - "https://$REGISTRY/v2/$name/manifests/$reference" | tr -d '\r' | grep -i '^www-authenticate:')
+            realm=$(sed -E 's/.*realm="([^"]+)".*/\1/' <<<"$challenge")
+            service=$(sed -E 's/.*service="([^"]+)".*/\1/' <<<"$challenge")
+            token=$(curl -fsS -u "sa-registry:$REGISTRY_TOKEN" --get --data-urlencode "service=$service" \
+              --data-urlencode "scope=repository:$name:pull" "$realm" | jq -er '.token // .access_token')
+            headers=$(mktemp)
+            body=$(mktemp)
+            status=$(curl -sS -o "$body" -D "$headers" -w '%{http_code}' -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://$REGISTRY/v2/$name/manifests/$reference")
+            case "$status" in
+              404) return 0 ;;
+              200) ;;
+              *) echo "::error::registry returned HTTP $status for $name:$reference" >&2; return 1 ;;
+            esac
+            digest=$(tr -d '\r' <"$headers" | grep -i '^docker-content-digest:' | awk '{print $2}')
+            if jq -e '.manifests' "$body" >/dev/null; then
+              child=$(jq -er '[.manifests[] | select(.platform.os != "unknown")][0].digest' "$body")
+              curl -fsS -o "$body" -H "Authorization: Bearer $token" \
+                -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+                "https://$REGISTRY/v2/$name/manifests/$child"
+            fi
+            config=$(jq -er '.config.digest' "$body")
+            revision=$(curl -fsSL -H "Authorization: Bearer $token" "https://$REGISTRY/v2/$name/blobs/$config" \
+              | jq -r --arg l "$REVISION_LABEL" '.config.Labels[$l] // ""')
+            echo "$digest $revision"
+          }
+          SH
+
+      - name: Guard existing immutable tags
+        env:
+          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token }}
+        run: |
+          set -euo pipefail
+          . "$DOCKER_CONFIG/registry-api.sh"
+          status=0
+          while IFS= read -r image; do
+            remote=$(remote_manifest "$image" "$CI_IMAGE_TAG")
+            if [ -z "$remote" ]; then
+              echo "$image:$CI_IMAGE_TAG is new"
+            elif [ "${remote#* }" = "$CI_REVISION" ]; then
+              echo "$image:$CI_IMAGE_TAG already exists for revision $CI_REVISION; the rerun pushes it again"
+            else
+              echo "::error title=immutable tag::$image:$CI_IMAGE_TAG already exists with $REVISION_LABEL='${remote#* }', this run is revision $CI_REVISION"
+              status=1
+            fi
+          done <<<"$CI_IMAGES"
+          exit "$status"
+
+      - name: Push immutable tags
+        env:
+          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token }}
+        run: |
+          set -euo pipefail
+          . "$DOCKER_CONFIG/registry-api.sh"
+          while IFS= read -r image; do
+            docker push "$image:$CI_IMAGE_TAG"
+          done <<<"$CI_IMAGES"
+          while IFS= read -r image; do
+            remote=$(remote_manifest "$image" "$CI_IMAGE_TAG")
+            digest=${remote%% *}
+            [ -n "$digest" ] || { echo "::error::$image:$CI_IMAGE_TAG is missing after push"; exit 1; }
+            docker pull -q "$image@$digest" >/dev/null
+            revision=$(docker image inspect "$image@$digest" --format "{{ with .Config.Labels }}{{ index . \"$REVISION_LABEL\" }}{{ end }}")
+            if [ "$revision" != "$CI_REVISION" ]; then
+              echo "::error title=revision label::pulled back $image@$digest has $REVISION_LABEL='$revision', expected $CI_REVISION"
+              exit 1
+            fi
+            echo "$image:$CI_IMAGE_TAG $digest $REVISION_LABEL=$revision"
+            echo "$image $CI_IMAGE_TAG $digest" >>"$CI_DIGESTS"
+          done <<<"$CI_IMAGES"
+
+      - name: Move channel tags
+        if: env.CHANNEL != ''
+        env:
+          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token }}
+        run: |
+          set -euo pipefail
+          . "$DOCKER_CONFIG/registry-api.sh"
+          while IFS= read -r image; do
+            docker tag "$image:$CI_IMAGE_TAG" "$image:$CHANNEL"
+            docker push "$image:$CHANNEL"
+          done <<<"$CI_IMAGES"
+          while IFS= read -r image; do
+            expected=$(awk -v i="$image" -v t="$CI_IMAGE_TAG" '$1 == i && $2 == t { print $3 }' "$CI_DIGESTS")
+            remote=$(remote_manifest "$image" "$CHANNEL")
+            if [ "${remote%% *}" != "$expected" ]; then
+              echo "::error title=channel digest::$image:$CHANNEL is '${remote%% *}', expected $expected from :$CI_IMAGE_TAG"
+              exit 1
+            fi
+            echo "$image:$CHANNEL $expected"
+            echo "$image $CHANNEL $expected" >>"$CI_DIGESTS"
+          done <<<"$CI_IMAGES"
+
+      - name: Create GitHub Deployment
+        if: env.SIGNAL == 'deployment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          payload=$(jq -nc --arg ref "$CI_REVISION" --arg env "$DEPLOYMENT_ENVIRONMENT" \
+            '{ref: $ref, environment: $env, auto_merge: false, required_contexts: []}')
+          id=$(curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            -d "$payload" "$API/deployments" | jq -er .id)
+          echo "Deployment $id for $CI_REVISION in environment $DEPLOYMENT_ENVIRONMENT"
+          echo "SIGNAL_RESULT=Deployment $id" >>"$GITHUB_ENV"
+
+      - name: Commit version to the default branch
+        if: env.SIGNAL == 'version-commit'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json')
+          branch=$(curl -fsS "${auth[@]}" "$API" | jq -er .default_branch)
+          current=$(curl -fsS "${auth[@]}" "$API/contents/$VERSION_FILE?ref=$branch")
+          blob=$(jq -er .sha <<<"$current")
+          file="$RUNNER_TEMP/ci-image-version-file"
+          jq -er .content <<<"$current" | base64 -d >"$file"
+          count=$(grep -c "^$VERSION_KEY=" "$file" || true)
+          if [ "$count" != 1 ]; then
+            echo "::error title=version line::$VERSION_FILE on $branch has $count lines starting with '$VERSION_KEY=', expected exactly 1"
+            exit 1
+          fi
+          if grep -qx "$VERSION_KEY=$CI_IMAGE_TAG" "$file"; then
+            echo "$VERSION_FILE already declares $VERSION_KEY=$CI_IMAGE_TAG on $branch; no commit"
+            echo "SIGNAL_RESULT=unchanged, $VERSION_KEY=$CI_IMAGE_TAG already on $branch" >>"$GITHUB_ENV"
+            exit 0
+          fi
+          sed -i "s|^$VERSION_KEY=.*\$|$VERSION_KEY=$CI_IMAGE_TAG|" "$file"
+          payload=$(jq -nc --arg message "chore(release): deploy $CI_IMAGE_TAG" --arg branch "$branch" --arg sha "$blob" \
+            --arg content "$(base64 -w0 <"$file")" '{message: $message, content: $content, sha: $sha, branch: $branch}')
+          if ! response=$(curl -sS --fail-with-body -X PUT "${auth[@]}" -d "$payload" "$API/contents/$VERSION_FILE"); then
+            echo "::error title=version commit rejected::$(jq -r '.message // .' <<<"$response" 2>/dev/null || echo "$response")"
+            exit 1
+          fi
+          commit=$(jq -er .commit.sha <<<"$response")
+          echo "Committed $VERSION_KEY=$CI_IMAGE_TAG to $branch as $commit"
+          echo "SIGNAL_RESULT=commit $commit" >>"$GITHUB_ENV"
+
+      - name: Record the publication
+        id: published
+        run: |
+          echo "published=true" >>"$GITHUB_OUTPUT"
+          echo "PUBLISHED=true" >>"$GITHUB_ENV"
+
+      - name: Log out and remove registry credentials
+        if: always() && env.DOCKER_CONFIG != ''
+        run: |
+          docker logout "$REGISTRY" || true
+          rm -rf "$DOCKER_CONFIG"
+
+      - *summarize

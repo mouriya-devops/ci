@@ -5,3 +5,7 @@ shellcheck = "latest"
 [tasks.check]
 description = "Lint every workflow in .github/workflows"
 run = "actionlint"
+
+[tasks.build]
+description = "Self-test fixture for image.yml: build ci-selftest/alpha and ci-selftest/beta"
+run = "selftest/image/build.sh"
