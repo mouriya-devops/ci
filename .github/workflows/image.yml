@@ -27,8 +27,10 @@ on:
         required: true
       images:
         description: >-
-          Newline-separated full repositories, each starting with
-          `registry.237575.xyz/`, no duplicates. The `build` task must leave
+          Newline-separated full repositories, no duplicates, all in one
+          registry: `registry.237575.xyz/` for private images, or
+          `ghcr.io/<repository owner>/` for public images (the caller grants
+          `packages: write` to publish there). The `build` task must leave
           `<repository>:<tag>` in the local docker daemon for every entry.
         type: string
         required: true
@@ -70,8 +72,9 @@ on:
     secrets:
       KEYCLOAK_REGISTRY_CLIENT_SECRET:
         description: >-
-          Keycloak `registry` client secret; required in `publish` mode. Pass
-          it explicitly, not with `secrets: inherit`.
+          Keycloak `registry` client secret; required in `publish` mode for
+          `registry.237575.xyz/` images. Pass it explicitly, not with
+          `secrets: inherit`.
         required: false
     outputs:
       built:
@@ -92,6 +95,7 @@ jobs:
       runs-on: ${{ steps.parse.outputs.runs-on }}
       ref: ${{ steps.parse.outputs.ref }}
       mode: ${{ steps.parse.outputs.mode }}
+      registry: ${{ steps.parse.outputs.registry }}
       images: ${{ steps.parse.outputs.images }}
       tag: ${{ steps.parse.outputs.tag }}
       channel: ${{ steps.parse.outputs.channel }}
@@ -116,12 +120,14 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           fail() { echo "::error title=invalid input $1::$1: $2"; exit 1; }
           tag_re='^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'
-          repo_re='^registry\.237575\.xyz/[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$'
+          path_re='[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*'
+          owner=$(tr '[:upper:]' '[:lower:]' <<<"$OWNER")
           single_line() { [[ "$2" != *$'\n'* ]] || fail "$1" "must be a single line"; }
 
           jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' \
@@ -135,11 +141,20 @@ jobs:
           esac
 
           images=()
+          registry=
           while IFS= read -r line; do
             line=$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' <<<"$line")
             [ -n "$line" ] || continue
-            [[ "$line" =~ $repo_re ]] \
-              || fail images "'$line' is not a repository under registry.237575.xyz/ (no tag or digest)"
+            if [[ "$line" =~ ^registry\.237575\.xyz/$path_re$ ]]; then
+              line_registry=registry.237575.xyz
+            elif [[ "$line" =~ ^ghcr\.io/$owner/$path_re$ ]]; then
+              line_registry=ghcr.io
+            else
+              fail images "'$line' is not a repository under registry.237575.xyz/ or ghcr.io/$owner/ (no tag or digest)"
+            fi
+            [ -z "$registry" ] || [ "$registry" = "$line_registry" ] \
+              || fail images "'$line' is in $line_registry, other images are in $registry; one run publishes to one registry"
+            registry=$line_registry
             for seen in "${images[@]}"; do
               [ "$seen" != "$line" ] || fail images "'$line' is listed twice"
             done
@@ -179,9 +194,9 @@ jobs:
             [ -z "$IN_CHANNEL" ] || fail channel "not allowed with mode build-only"
             [ -z "$IN_DEPLOYMENT_ENVIRONMENT" ] || fail deployment-environment "not allowed with mode build-only"
             [ -z "$IN_VERSION_FILE" ] || fail version-file "not allowed with mode build-only"
-          else
+          elif [ "$registry" = registry.237575.xyz ]; then
             [ "$HAS_REGISTRY_SECRET" = true ] \
-              || fail KEYCLOAK_REGISTRY_CLIENT_SECRET "secret is required with mode publish; pass it explicitly"
+              || fail KEYCLOAK_REGISTRY_CLIENT_SECRET "secret is required to publish to registry.237575.xyz; pass it explicitly"
           fi
 
           case "$EVENT_NAME" in
@@ -197,6 +212,7 @@ jobs:
             echo "runs-on=$runs_on"
             echo "ref=${IN_REF:-$SHA}"
             echo "mode=$IN_MODE"
+            echo "registry=$registry"
             echo "images<<CI_IMAGES_EOF"
             printf '%s\n' "${images[@]}"
             echo "CI_IMAGES_EOF"
@@ -229,7 +245,8 @@ jobs:
       DEPLOYMENT_ENVIRONMENT: ${{ needs.parse.outputs.deployment-environment }}
       VERSION_FILE: ${{ needs.parse.outputs.version-file }}
       VERSION_KEY: ${{ needs.parse.outputs.version-key }}
-      REGISTRY: registry.237575.xyz
+      REGISTRY: ${{ needs.parse.outputs.registry }}
+      REGISTRY_USER: ${{ needs.parse.outputs.registry == 'ghcr.io' && github.actor || 'sa-registry' }}
       REVISION_LABEL: org.opencontainers.image.revision
     steps:
       - &checkout
@@ -367,6 +384,7 @@ jobs:
 
       - name: Fetch registry token
         id: registry-token
+        if: env.REGISTRY == 'registry.237575.xyz'
         uses: mouriya-devops/keycloak-token-action@main
         with:
           keycloak-url: https://keycloak.237575.xyz
@@ -376,23 +394,29 @@ jobs:
 
       - name: Log in to the registry
         env:
-          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token }}
+          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token || github.token }}
         run: |
           set -euo pipefail
           config="$RUNNER_TEMP/ci-image-docker-config-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$config"
           echo "DOCKER_CONFIG=$config" >>"$GITHUB_ENV"
-          printf '%s' "$REGISTRY_TOKEN" | DOCKER_CONFIG="$config" docker login "$REGISTRY" -u sa-registry --password-stdin
+          printf '%s' "$REGISTRY_TOKEN" | DOCKER_CONFIG="$config" docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
           # Registry API reader: inspects remote tags without pulling them over the local tags.
           cat >"$config/registry-api.sh" <<'SH'
           # remote_manifest <repository> <reference>: prints "<digest> <revision label>", or nothing when absent.
+          # ghcr.io denies a pull token for a package that does not exist yet; that counts as absent,
+          # and the push step's read-back still fails when the push itself was denied.
           remote_manifest() {
             local name=${1#"$REGISTRY"/} reference=$2 challenge realm service token headers body status digest child config revision
             challenge=$(curl -sS -o /dev/null -D - "https://$REGISTRY/v2/$name/manifests/$reference" | tr -d '\r' | grep -i '^www-authenticate:')
             realm=$(sed -E 's/.*realm="([^"]+)".*/\1/' <<<"$challenge")
             service=$(sed -E 's/.*service="([^"]+)".*/\1/' <<<"$challenge")
-            token=$(curl -fsS -u "sa-registry:$REGISTRY_TOKEN" --get --data-urlencode "service=$service" \
-              --data-urlencode "scope=repository:$name:pull" "$realm" | jq -er '.token // .access_token')
+            if ! token=$(curl -fsS -u "$REGISTRY_USER:$REGISTRY_TOKEN" --get --data-urlencode "service=$service" \
+              --data-urlencode "scope=repository:$name:pull" "$realm" | jq -er '.token // .access_token'); then
+              [ "$REGISTRY" = ghcr.io ] && return 0
+              echo "::error::no pull token for $name from $realm" >&2
+              return 1
+            fi
             headers=$(mktemp)
             body=$(mktemp)
             status=$(curl -sS -o "$body" -D "$headers" -w '%{http_code}' -H "Authorization: Bearer $token" \
@@ -400,6 +424,8 @@ jobs:
               "https://$REGISTRY/v2/$name/manifests/$reference")
             case "$status" in
               404) return 0 ;;
+              401|403) [ "$REGISTRY" = ghcr.io ] && return 0
+                echo "::error::registry returned HTTP $status for $name:$reference" >&2; return 1 ;;
               200) ;;
               *) echo "::error::registry returned HTTP $status for $name:$reference" >&2; return 1 ;;
             esac
@@ -419,7 +445,7 @@ jobs:
 
       - name: Guard existing immutable tags
         env:
-          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token }}
+          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token || github.token }}
         run: |
           set -euo pipefail
           . "$DOCKER_CONFIG/registry-api.sh"
@@ -439,7 +465,7 @@ jobs:
 
       - name: Push immutable tags
         env:
-          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token }}
+          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token || github.token }}
         run: |
           set -euo pipefail
           . "$DOCKER_CONFIG/registry-api.sh"
@@ -463,7 +489,7 @@ jobs:
       - name: Move channel tags
         if: env.CHANNEL != ''
         env:
-          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token }}
+          REGISTRY_TOKEN: ${{ steps.registry-token.outputs.access-token || github.token }}
         run: |
           set -euo pipefail
           . "$DOCKER_CONFIG/registry-api.sh"
