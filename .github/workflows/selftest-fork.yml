@@ -9,4 +9,4 @@ jobs:
   check:
     uses: mouriya-devops/ci/.github/workflows/check.yml@main
     with:
-      runs-on: '["self-hosted","linux"]'
+      runs-on: '["ubuntu-24.04"]'
