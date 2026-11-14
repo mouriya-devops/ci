@@ -1,0 +1,92 @@
+name: check
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          JSON array of runner labels for the check job, passed to
+          `runs-on: fromJSON(...)`. GitHub-hosted (`["ubuntu-24.04"]`) or a
+          GARM self-hosted label set. Pull requests from another repository
+          are rejected when any label is `self-hosted`.
+        type: string
+        default: '["ubuntu-24.04"]'
+      ref:
+        description: >-
+          Commit, branch or tag to check out and check. Empty means the
+          triggering commit.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  parse:
+    runs-on: ubuntu-24.04
+    outputs:
+      runs-on: ${{ steps.parse.outputs.runs-on }}
+      ref: ${{ steps.parse.outputs.ref }}
+    steps:
+      - name: Parse inputs
+        id: parse
+        env:
+          IN_RUNS_ON: ${{ inputs.runs-on }}
+          IN_REF: ${{ inputs.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=invalid input $1::$1: $2"; exit 1; }
+
+          jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' \
+            <<<"$IN_RUNS_ON" >/dev/null 2>&1 \
+            || fail runs-on "must be a non-empty JSON array of non-empty strings, got '$IN_RUNS_ON'"
+          runs_on=$(jq -c . <<<"$IN_RUNS_ON")
+
+          case "$EVENT_NAME" in
+            pull_request|pull_request_target)
+              if [ "$HEAD_REPO" != "$REPO" ] \
+                && jq -e 'any(.[]; ascii_downcase == "self-hosted")' <<<"$runs_on" >/dev/null; then
+                fail runs-on "pull request from '${HEAD_REPO:-<deleted repository>}' must not run on self-hosted runners of $REPO"
+              fi
+              ;;
+          esac
+
+          {
+            echo "runs-on=$runs_on"
+            echo "ref=${IN_REF:-$SHA}"
+          } >>"$GITHUB_OUTPUT"
+
+  check:
+    needs: parse
+    runs-on: ${{ fromJSON(needs.parse.outputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@main
+        with:
+          ref: ${{ needs.parse.outputs.ref }}
+          persist-credentials: false
+
+      - name: Install mise and repository toolchain
+        uses: jdx/mise-action@main
+
+      - name: Summarize task and toolchain
+        run: |
+          set -euo pipefail
+          {
+            echo '### check'
+            echo
+            echo "Task: \`mise run check\` at \`$(git rev-parse HEAD)\`"
+            echo
+            echo '| tool | version |'
+            echo '|---|---|'
+            mise ls --current --json \
+              | jq -r 'to_entries[] | .key as $t | .value[] | "| \($t) | \(.version) |"'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: mise run check
+        env:
+          CI: 'true'
+        run: mise run check
