@@ -1,0 +1,52 @@
+name: mise-check
+description: >-
+  Install the repository's mise toolchain and run one mise task with CI=true.
+  Use it as a step of a job named `test` so the pull request shows a single
+  top-level `test` check. The caller checks out the repository first.
+
+inputs:
+  task:
+    description: >-
+      mise task to run, matching `^[A-Za-z0-9_][A-Za-z0-9_:-]*$`. Pull requests
+      from another repository are rejected unless the job runs on a
+      GitHub-hosted runner.
+    default: check
+
+runs:
+  using: composite
+  steps:
+    - name: Guard task name and runner
+      shell: bash
+      env:
+        TASK: ${{ inputs.task }}
+        EVENT_NAME: ${{ github.event_name }}
+        HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        REPO: ${{ github.repository }}
+      run: '"$GITHUB_ACTION_PATH/guard.sh"'
+
+    - name: Install mise and repository toolchain
+      uses: jdx/mise-action@main
+
+    - name: Summarize task and toolchain
+      shell: bash
+      env:
+        TASK: ${{ inputs.task }}
+      run: |
+        set -euo pipefail
+        {
+          echo '### mise-check'
+          echo
+          echo "Task: \`mise run $TASK\` at \`$(git rev-parse HEAD)\`"
+          echo
+          echo '| tool | version |'
+          echo '|---|---|'
+          mise ls --current --json \
+            | jq -r 'to_entries[] | .key as $t | .value[] | "| \($t) | \(.version) |"'
+        } >>"$GITHUB_STEP_SUMMARY"
+
+    - name: mise run
+      shell: bash
+      env:
+        CI: 'true'
+        TASK: ${{ inputs.task }}
+      run: mise run "$TASK"

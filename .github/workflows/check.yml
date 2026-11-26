@@ -17,6 +17,11 @@ on:
           triggering commit.
         type: string
         default: ''
+      task:
+        description: >-
+          mise task to run, matching `^[A-Za-z0-9_][A-Za-z0-9_:-]*$`.
+        type: string
+        default: 'check'
 
 permissions:
   contents: read
@@ -27,12 +32,14 @@ jobs:
     outputs:
       runs-on: ${{ steps.parse.outputs.runs-on }}
       ref: ${{ steps.parse.outputs.ref }}
+      task: ${{ steps.parse.outputs.task }}
     steps:
       - name: Parse inputs
         id: parse
         env:
           IN_RUNS_ON: ${{ inputs.runs-on }}
           IN_REF: ${{ inputs.ref }}
+          IN_TASK: ${{ inputs.task }}
           EVENT_NAME: ${{ github.event_name }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           REPO: ${{ github.repository }}
@@ -46,6 +53,9 @@ jobs:
             || fail runs-on "must be a non-empty JSON array of non-empty strings, got '$IN_RUNS_ON'"
           runs_on=$(jq -c . <<<"$IN_RUNS_ON")
 
+          [[ "$IN_TASK" =~ ^[A-Za-z0-9_][A-Za-z0-9_:-]*$ ]] \
+            || fail task "must match ^[A-Za-z0-9_][A-Za-z0-9_:-]*\$, got '$IN_TASK'"
+
           case "$EVENT_NAME" in
             pull_request|pull_request_target)
               if [ "$HEAD_REPO" != "$REPO" ] \
@@ -58,6 +68,7 @@ jobs:
           {
             echo "runs-on=$runs_on"
             echo "ref=${IN_REF:-$SHA}"
+            echo "task=$IN_TASK"
           } >>"$GITHUB_OUTPUT"
 
   check:
@@ -73,12 +84,14 @@ jobs:
         uses: jdx/mise-action@main
 
       - name: Summarize task and toolchain
+        env:
+          TASK: ${{ needs.parse.outputs.task }}
         run: |
           set -euo pipefail
           {
             echo '### check'
             echo
-            echo "Task: \`mise run check\` at \`$(git rev-parse HEAD)\`"
+            echo "Task: \`mise run $TASK\` at \`$(git rev-parse HEAD)\`"
             echo
             echo '| tool | version |'
             echo '|---|---|'
@@ -86,7 +99,8 @@ jobs:
               | jq -r 'to_entries[] | .key as $t | .value[] | "| \($t) | \(.version) |"'
           } >>"$GITHUB_STEP_SUMMARY"
 
-      - name: mise run check
+      - name: mise run
         env:
           CI: 'true'
-        run: mise run check
+          TASK: ${{ needs.parse.outputs.task }}
+        run: mise run "$TASK"

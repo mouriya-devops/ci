@@ -6,6 +6,10 @@ shellcheck = "latest"
 description = "Lint every workflow in .github/workflows"
 run = "actionlint"
 
+[tasks."selftest:task"]
+description = "Self-test fixture for actions/mise-check and the check.yml task input: report CI and leave a marker"
+run = 'echo "selftest:task ran with CI=$CI" | tee "${RUNNER_TEMP:-/tmp}/selftest-task-ran"'
+
 [tasks.build]
 description = "Self-test fixture for image.yml: build ci-selftest/alpha and ci-selftest/beta"
 run = "selftest/image/build.sh"
