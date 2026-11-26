@@ -1,9 +1,15 @@
 [tools]
 "aqua:rhysd/actionlint" = "latest"
 shellcheck = "latest"
+bun = "latest"
+
+[tasks."check:pr"]
+description = "Offline workflow policy self-test of .github/workflows and actions"
+run = "bun test selftest"
 
 [tasks.check]
-description = "Lint every workflow in .github/workflows"
+description = "Lint every workflow in .github/workflows and run the workflow policy self-test"
+depends = ["check:pr"]
 run = "actionlint"
 
 [tasks."selftest:task"]
