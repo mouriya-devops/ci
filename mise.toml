@@ -4,13 +4,12 @@ shellcheck = "latest"
 bun = "latest"
 
 [tasks."check:pr"]
-description = "Offline workflow policy self-test of .github/workflows and actions"
-run = "bun test selftest"
+description = "Lint every workflow in .github/workflows with actionlint and shellcheck, then run the offline workflow policy self-test"
+run = "actionlint && bun test selftest"
 
 [tasks.check]
-description = "Lint every workflow in .github/workflows and run the workflow policy self-test"
+description = "Run every check: actionlint and shellcheck on .github/workflows, then the workflow policy self-test"
 depends = ["check:pr"]
-run = "actionlint"
 
 [tasks."selftest:task"]
 description = "Self-test fixture for actions/mise-check and the check.yml task input: report CI and leave a marker"

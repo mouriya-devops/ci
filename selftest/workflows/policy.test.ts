@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 type Mapping = Record<string, unknown>;
 
@@ -145,46 +146,206 @@ describe("self-check.yml", () => {
 });
 
 describe("cross-repo pull request rejection", () => {
-  test("check.yml keeps the self-hosted rejection in its parse job", () => {
-    const parseJob = asMapping(asMapping(readMapping(".github/workflows/check.yml").jobs).parse);
-    const parse = jobSteps(parseJob).find((step) => step.id === "parse");
-    expect(parse).toBeDefined();
-    const env = asMapping(parse?.env);
-    expect(env).toHaveProperty("HEAD_REPO");
-    expect(env).toHaveProperty("REPO");
-    const script = String(parse?.run);
-    for (const fragment of [
-      "pull_request|pull_request_target",
-      '[ "$HEAD_REPO" != "$REPO" ]',
-      'ascii_downcase == "self-hosted"',
-      "fail runs-on",
-    ]) {
-      expect(script).toContain(fragment);
+  type ScriptResult = { status: number | null; output: string };
+
+  const runScript = (script: string, env: Record<string, string>, withCurlStub = false): ScriptResult => {
+    const dir = mkdtempSync(join(tmpdir(), "ci-policy-"));
+    try {
+      const scriptPath = join(dir, "step.sh");
+      writeFileSync(scriptPath, script);
+      const externalCall = '#!/usr/bin/env bash\necho "unexpected external call: $0" >&2\nexit 99\n';
+      for (const command of ["gh", "docker", "skopeo"]) {
+        writeFileSync(join(dir, command), externalCall, { mode: 0o755 });
+      }
+      writeFileSync(
+        join(dir, "curl"),
+        withCurlStub ? '#!/usr/bin/env bash\nprintf \'{"sha":"%s"}\\n\' "${STUB_SHA:-stub}"\n' : externalCall,
+        { mode: 0o755 },
+      );
+      const result = Bun.spawnSync({
+        cmd: ["bash", "--noprofile", "--norc", "-eo", "pipefail", scriptPath],
+        env: {
+          ...process.env,
+          ...env,
+          GITHUB_OUTPUT: join(dir, "github-output"),
+          GITHUB_STEP_SUMMARY: join(dir, "step-summary"),
+          PATH: `${dir}:${process.env.PATH ?? ""}`,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      return { status: result.exitCode, output: `${result.stdout.toString()}${result.stderr.toString()}` };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
+  };
+
+  const stepMapping = (file: string, jobId: string, stepId: string): Mapping => {
+    const job = asMapping(asMapping(readMapping(file).jobs)[jobId]);
+    const step = jobSteps(job).find((candidate) => candidate.id === stepId);
+    if (step === undefined) throw new Error(`${file} ${jobId}.${stepId} is missing`);
+    return step;
+  };
+
+  const stepScript = (file: string, jobId: string, stepId: string): string => {
+    const script = stepMapping(file, jobId, stepId).run;
+    if (typeof script !== "string") throw new Error(`${file} ${jobId}.${stepId} has no run script`);
+    if (script.includes("${{")) {
+      throw new Error(file + " " + jobId + "." + stepId + " expands ${{ }} inside run; this probe executes it verbatim");
+    }
+    return script;
+  };
+
+  const pullRequest = {
+    EVENT_NAME: "pull_request",
+    HEAD_REPO: "other/repo",
+    REPO: "me/repo",
+    SHA: "deadbeef",
+  };
+  const selfHosted = '["self-hosted","linux"]';
+  const selfHostedMixedCase = '["Self-Hosted","linux"]';
+  const hosted = '["ubuntu-24.04"]';
+  const pullRequestEvents = ["pull_request", "pull_request_target"];
+  const rejected = "must not run on self-hosted runners of me/repo";
+
+  const probes = [
+    {
+      file: ".github/workflows/check.yml",
+      job: "parse",
+      step: "parse",
+      rejected,
+      curlStub: false,
+      env: (runsOn: string): Record<string, string> => ({
+        ...pullRequest,
+        IN_RUNS_ON: runsOn,
+        IN_REF: "",
+        IN_TASK: "check",
+      }),
+    },
+    {
+      file: ".github/workflows/image.yml",
+      job: "parse",
+      step: "parse",
+      rejected,
+      curlStub: false,
+      env: (runsOn: string): Record<string, string> => ({
+        ...pullRequest,
+        IN_RUNS_ON: runsOn,
+        IN_REF: "",
+        IN_MODE: "build-only",
+        IN_IMAGES: "registry.237575.xyz/ci-selftest/alpha",
+        IN_TAG: "selftest",
+        IN_CHANNEL: "",
+        IN_DEPLOYMENT_ENVIRONMENT: "",
+        IN_VERSION_FILE: "",
+        IN_VERSION_KEY: "",
+        HAS_REGISTRY_SECRET: "false",
+        OWNER: "me",
+      }),
+    },
+    {
+      file: ".github/workflows/release-artifact.yml",
+      job: "parse",
+      step: "parse",
+      rejected,
+      curlStub: true,
+      env: (runsOn: string): Record<string, string> => ({
+        ...pullRequest,
+        IN_PLATFORMS: `[{"name":"alpha","runs-on":${runsOn}}]`,
+        IN_REF: "",
+        IN_MODE: "build-only",
+        IN_TAG: "",
+        GH_TOKEN: "stub",
+        API: "https://api.invalid/repos/me/repo",
+        GITHUB_RUN_ATTEMPT: "1",
+        STUB_SHA: "deadbeef",
+      }),
+    },
+  ];
+
+  test("every workflow with a caller-controlled runs-on is probed for the rejection", () => {
+    const discovered = workflowFiles
+      .filter((file) => {
+        const jobs = asMapping(readMapping(file).jobs);
+        return Object.values(jobs).some((job) => {
+          const runsOn = asMapping(job)["runs-on"];
+          const labels = Array.isArray(runsOn) ? runsOn : [runsOn];
+          return labels.some((label) => typeof label === "string" && label.includes("${{"));
+        });
+      })
+      .sort();
+    expect(discovered.length).toBeGreaterThan(0);
+    expect(
+      [...new Set(probes.map((probe) => probe.file))].sort(),
+      `probe these caller-controlled workflows: ${discovered.join(", ")}`,
+    ).toEqual(discovered);
   });
 
-  test("actions/mise-check keeps the off-hosted rejection in its guard", () => {
-    const guard = readText("actions/mise-check/guard.sh");
-    for (const fragment of [
-      "pull_request|pull_request_target",
-      '"${HEAD_REPO:-}" != "${REPO:-}"',
-      "github-hosted",
-      "fail runner",
-    ]) {
-      expect(guard).toContain(fragment);
-    }
+  for (const probe of probes) {
+    test(`${probe.file} rejects a fork pull request on self-hosted runners`, () => {
+      const script = stepScript(probe.file, probe.job, probe.step);
+      const declared = Object.keys(asMapping(stepMapping(probe.file, probe.job, probe.step).env));
+      expect(declared.filter((key) => !(key in probe.env(selfHosted)))).toEqual([]);
+      for (const event of pullRequestEvents) {
+        for (const runsOn of [selfHosted, selfHostedMixedCase]) {
+          const result = runScript(script, { ...probe.env(runsOn), EVENT_NAME: event }, probe.curlStub);
+          expect(result.status).not.toBe(0);
+          expect(result.output).toContain(probe.rejected);
+        }
+      }
+    });
+
+    test(`${probe.file} allows a fork pull request on GitHub-hosted runners`, () => {
+      const script = stepScript(probe.file, probe.job, probe.step);
+      for (const event of pullRequestEvents) {
+        const result = runScript(script, { ...probe.env(hosted), EVENT_NAME: event }, probe.curlStub);
+        expect(result.status).toBe(0);
+        expect(result.output).not.toContain("must not run on");
+      }
+    });
+  }
+
+  const guardScript = readText("actions/mise-check/guard.sh");
+  const guardEnv = (overrides: Record<string, string>): Record<string, string> => ({
+    TASK: "check",
+    EVENT_NAME: "pull_request",
+    HEAD_REPO: "other/repo",
+    REPO: "me/repo",
+    RUNNER_ENVIRONMENT: "self-hosted",
+    ...overrides,
+  });
+
+  test("actions/mise-check/guard.sh rejects a fork pull request off a GitHub-hosted runner", () => {
+    const result = runScript(guardScript, guardEnv({}));
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain("must not run on a self-hosted runner of me/repo");
+    const unknown = runScript(guardScript, guardEnv({ RUNNER_ENVIRONMENT: "" }));
+    expect(unknown.status).not.toBe(0);
+    expect(unknown.output).toContain("must not run on a unknown runner of me/repo");
+  });
+
+  test("actions/mise-check/guard.sh allows a fork pull request on a GitHub-hosted runner", () => {
+    const result = runScript(guardScript, guardEnv({ RUNNER_ENVIRONMENT: "github-hosted" }));
+    expect(result.status).toBe(0);
+    expect(result.output).not.toContain("must not run on");
+  });
+
+  test("actions/mise-check/guard.sh allows a same-repository pull request on a self-hosted runner", () => {
+    const result = runScript(guardScript, guardEnv({ HEAD_REPO: "me/repo" }));
+    expect(result.status).toBe(0);
+    expect(result.output).not.toContain("must not run on");
   });
 });
 
 describe("mise tasks", () => {
   const tasks = asMapping(asMapping(Bun.TOML.parse(readText("mise.toml"))).tasks);
 
-  test("check:pr runs the policy self-test", () => {
-    expect(asMapping(tasks["check:pr"]).run).toBe("bun test selftest");
+  test("check:pr lints workflows and runs the policy self-test", () => {
+    expect(asMapping(tasks["check:pr"]).run).toBe("actionlint && bun test selftest");
   });
 
-  test("check includes actionlint and check:pr", () => {
+  test("check is a superset of check:pr", () => {
     expect(asMapping(tasks.check).depends).toEqual(["check:pr"]);
-    expect(String(asMapping(tasks.check).run)).toContain("actionlint");
+    expect(asMapping(tasks.check).run).toBeUndefined();
   });
 });
