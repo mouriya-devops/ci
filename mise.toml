@@ -1,10 +1,15 @@
 [tools]
 "aqua:rhysd/actionlint" = "latest"
 shellcheck = "latest"
+bun = "latest"
+
+[tasks."check:pr"]
+description = "Lint every workflow in .github/workflows with actionlint and shellcheck, then run the offline workflow policy self-test"
+run = "actionlint && bun test selftest"
 
 [tasks.check]
-description = "Lint every workflow in .github/workflows"
-run = "actionlint"
+description = "Run every check: actionlint and shellcheck on .github/workflows, then the workflow policy self-test"
+depends = ["check:pr"]
 
 [tasks."selftest:task"]
 description = "Self-test fixture for actions/mise-check and the check.yml task input: report CI and leave a marker"

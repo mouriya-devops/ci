@@ -2,7 +2,7 @@ name: self-check
 
 on:
   push:
-  pull_request:
+    branches: [main, 'tree/**']
 
 permissions:
   contents: read
